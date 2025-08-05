@@ -27,13 +27,34 @@
 //  Use the standard classes for std::, if available.
 #include <condition_variable>
 
-#include <atomic>
 #include <cassert>
 #include <chrono>
 #include <system_error>
-#include <windows.h>
+
+#include <sdkddkver.h>  //  Detect Windows version.
+#if (WINVER < _WIN32_WINNT_VISTA)
+#include <atomic>
+#endif
+#if (defined(__MINGW32__) && !defined(__MINGW64_VERSION_MAJOR))
+#pragma message "The Windows API that MinGW-w32 provides is not fully compatible\
+ with Microsoft's API. We'll try to work around this, but we can make no\
+ guarantees. This problem does not exist in MinGW-w64."
+#include <windows.h>    //  No further granularity can be expected.
+#else
+#if (WINVER < _WIN32_WINNT_VISTA)
+#include <windef.h>
+#include <winbase.h>  //  For CreateSemaphore
+#include <handleapi.h>
+#endif
+#include <synchapi.h>
+#endif
+
 #include "mingw.mutex.h"
 #include "mingw.shared_mutex.h"
+
+#if !defined(_WIN32_WINNT) || (_WIN32_WINNT < 0x0501)
+#error To use the MinGW-std-threads library, you will need to define the macro _WIN32_WINNT to be 0x0501 (Windows XP) or higher.
+#endif
 
 namespace mingw_stdthread
 {
@@ -50,13 +71,12 @@ namespace xp
 #if (WINVER < _WIN32_WINNT_VISTA)
 class condition_variable_any
 {
-protected:
-    recursive_mutex mMutex;
-    std::atomic<int> mNumWaiters;
+    recursive_mutex mMutex {};
+    std::atomic<int> mNumWaiters {0};
     HANDLE mSemaphore;
-    HANDLE mWakeEvent;
+    HANDLE mWakeEvent {};
 public:
-    typedef HANDLE native_handle_type;
+    using native_handle_type = HANDLE;
     native_handle_type native_handle()
     {
         return mSemaphore;
@@ -64,16 +84,23 @@ public:
     condition_variable_any(const condition_variable_any&) = delete;
     condition_variable_any& operator=(const condition_variable_any&) = delete;
     condition_variable_any()
-        :mMutex(), mNumWaiters(0),
-         mSemaphore(CreateSemaphore(NULL, 0, 0xFFFF, NULL)),
-         mWakeEvent(CreateEvent(NULL, FALSE, FALSE, NULL))
-    {}
+        :   mSemaphore(CreateSemaphoreA(NULL, 0, 0xFFFF, NULL))
+    {
+        if (mSemaphore == NULL)
+            throw std::system_error(GetLastError(), std::generic_category());
+        mWakeEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
+        if (mWakeEvent == NULL)
+        {
+            CloseHandle(mSemaphore);
+            throw std::system_error(GetLastError(), std::generic_category());
+        }
+    }
     ~condition_variable_any()
     {
         CloseHandle(mWakeEvent);
         CloseHandle(mSemaphore);
     }
-protected:
+private:
     template <class M>
     bool wait_impl(M& lock, DWORD timeout)
     {
@@ -100,7 +127,7 @@ protected:
 //we decremented it. This means that the semaphore count
 //after all waiters finish won't be 0 - because not all waiters
 //woke up by acquiring the semaphore - we woke up by a timeout.
-//The notify_all() must handle this grafecully
+//The notify_all() must handle this gracefully
 //
         else
         {
@@ -164,10 +191,9 @@ public:
                        const std::chrono::duration<Rep, Period>& rel_time)
     {
         using namespace std::chrono;
-        long long timeout = duration_cast<milliseconds>(rel_time).count();
-        if (timeout < 0)
-            timeout = 0;
-        bool ret = wait_impl(lock, (DWORD)timeout);
+        auto timeout = duration_cast<milliseconds>(rel_time).count();
+        DWORD waittime = (timeout < INFINITE) ? ((timeout < 0) ? 0 : static_cast<DWORD>(timeout)) : (INFINITE - 1);
+        bool ret = wait_impl(lock, waittime) || (timeout >= INFINITE);
         return ret?cv_status::no_timeout:cv_status::timeout;
     }
 
@@ -198,10 +224,9 @@ public:
         return true;
     }
 };
-class condition_variable: protected condition_variable_any
+class condition_variable: condition_variable_any
 {
-protected:
-    typedef condition_variable_any base;
+    using base = condition_variable_any;
 public:
     using base::native_handle_type;
     using base::native_handle;
@@ -247,8 +272,13 @@ namespace vista
 //  If compiling for Vista or higher, use the native condition variable.
 class condition_variable
 {
-protected:
-    CONDITION_VARIABLE cvariable_;
+    static constexpr DWORD kInfinite = 0xffffffffl;
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wzero-as-null-pointer-constant"
+    CONDITION_VARIABLE cvariable_ = CONDITION_VARIABLE_INIT;
+#pragma GCC diagnostic pop
+
+    friend class condition_variable_any;
 
 #if STDMUTEX_RECURSION_CHECKS
     template<typename MTX>
@@ -268,7 +298,8 @@ protected:
 
     bool wait_impl (unique_lock<xp::mutex> & lock, DWORD time)
     {
-        static_assert(std::is_same<typename xp::mutex::native_handle_type, PCRITICAL_SECTION>::value,
+        using mutex_handle_type = typename xp::mutex::native_handle_type;
+        static_assert(std::is_same<mutex_handle_type, PCRITICAL_SECTION>::value,
                       "Native Win32 condition variable requires std::mutex to \
 use native Win32 critical section objects.");
         xp::mutex * pmutex = lock.release();
@@ -286,7 +317,13 @@ use native Win32 critical section objects.");
         before_wait(pmutex);
         BOOL success = SleepConditionVariableSRW( native_handle(),
                                                   pmutex->native_handle(),
-                                                  time, 0);
+                                                  time,
+//    CONDITION_VARIABLE_LOCKMODE_SHARED has a value not specified by
+//  Microsoft's Dev Center, but is known to be (convertible to) a ULONG. To
+//  ensure that the value passed to this function is not equal to Microsoft's
+//  constant, we can either use a static_assert, or simply generate an
+//  appropriate value.
+                                           !CONDITION_VARIABLE_LOCKMODE_SHARED);
         after_wait(pmutex);
         return success;
     }
@@ -298,18 +335,13 @@ use native Win32 critical section objects.");
         return success;
     }
 public:
-    typedef PCONDITION_VARIABLE native_handle_type;
+    using native_handle_type = PCONDITION_VARIABLE;
     native_handle_type native_handle (void)
     {
         return &cvariable_;
     }
 
-    condition_variable (void)
-        : cvariable_()
-    {
-        InitializeConditionVariable(&cvariable_);
-    }
-
+    condition_variable (void) = default;
     ~condition_variable (void) = default;
 
     condition_variable (const condition_variable &) = delete;
@@ -327,7 +359,7 @@ public:
 
     void wait (unique_lock<mutex> & lock)
     {
-        wait_impl(lock, INFINITE);
+        wait_impl(lock, kInfinite);
     }
 
     template<class Predicate>
@@ -342,10 +374,9 @@ public:
                        const std::chrono::duration<Rep, Period>& rel_time)
     {
         using namespace std::chrono;
-        auto time = duration_cast<milliseconds>(rel_time).count();
-        if (time < 0)
-            time = 0;
-        bool result = wait_impl(lock, static_cast<DWORD>(time));
+        auto timeout = duration_cast<milliseconds>(rel_time).count();
+        DWORD waittime = (timeout < kInfinite) ? ((timeout < 0) ? 0 : static_cast<DWORD>(timeout)) : (kInfinite - 1);
+        bool result = wait_impl(lock, waittime) || (timeout >= kInfinite);
         return result ? cv_status::no_timeout : cv_status::timeout;
     }
 
@@ -380,23 +411,23 @@ public:
     }
 };
 
-class condition_variable_any : protected condition_variable
+class condition_variable_any
 {
-protected:
-    typedef condition_variable base;
-    typedef windows7::shared_mutex native_shared_mutex;
+    static constexpr DWORD kInfinite = 0xffffffffl;
+    using native_shared_mutex = windows7::shared_mutex;
 
+    condition_variable internal_cv_ {};
 //    When available, the SRW-based mutexes should be faster than the
 //  CriticalSection-based mutexes. Only try_lock will be unavailable in Vista,
 //  and try_lock is not used by condition_variable_any.
-    windows7::mutex internal_mutex_;
+    windows7::mutex internal_mutex_ {};
 
     template<class L>
     bool wait_impl (L & lock, DWORD time)
     {
         unique_lock<decltype(internal_mutex_)> internal_lock(internal_mutex_);
         lock.unlock();
-        bool success = base::wait_impl(internal_lock, time);
+        bool success = internal_cv_.wait_impl(internal_lock, time);
         lock.lock();
         return success;
     }
@@ -404,51 +435,52 @@ protected:
 //  contention.
     inline bool wait_impl (unique_lock<mutex> & lock, DWORD time)
     {
-        return base::wait_impl(lock, time);
+        return internal_cv_.wait_impl(lock, time);
     }
 //    Some shared_mutex functionality is available even in Vista, but it's not
 //  until Windows 7 that a full implementation is natively possible. The class
 //  itself is defined, with missing features, at the Vista feature level.
-    static_assert(CONDITION_VARIABLE_LOCKMODE_SHARED != 0, "The flag \
-CONDITION_VARIABLE_LOCKMODE_SHARED is not defined as expected. The value for \
-exclusive mode is unknown (not specified by Microsoft Dev Center), but assumed \
-to be 0. There is a conflict with CONDITION_VARIABLE_LOCKMODE_SHARED.");
-//#if (WINVER >= _WIN32_WINNT_VISTA)
     bool wait_impl (unique_lock<native_shared_mutex> & lock, DWORD time)
     {
         native_shared_mutex * pmutex = lock.release();
-        bool success = wait_unique(pmutex, time);
+        bool success = internal_cv_.wait_unique(pmutex, time);
         lock = unique_lock<native_shared_mutex>(*pmutex, adopt_lock);
         return success;
     }
     bool wait_impl (shared_lock<native_shared_mutex> & lock, DWORD time)
     {
         native_shared_mutex * pmutex = lock.release();
-        BOOL success = SleepConditionVariableSRW( base::native_handle(),
+        BOOL success = SleepConditionVariableSRW(native_handle(),
                        pmutex->native_handle(), time,
                        CONDITION_VARIABLE_LOCKMODE_SHARED);
         lock = shared_lock<native_shared_mutex>(*pmutex, adopt_lock);
         return success;
     }
-//#endif
 public:
-    typedef typename base::native_handle_type native_handle_type;
-    using base::native_handle;
+    using native_handle_type = typename condition_variable::native_handle_type;
 
-    condition_variable_any (void)
-        : base(), internal_mutex_()
+    native_handle_type native_handle (void)
     {
+        return internal_cv_.native_handle();
     }
 
-    ~condition_variable_any (void) = default;
+    void notify_one (void) noexcept
+    {
+        internal_cv_.notify_one();
+    }
 
-    using base::notify_one;
-    using base::notify_all;
+    void notify_all (void) noexcept
+    {
+        internal_cv_.notify_all();
+    }
+
+    condition_variable_any (void) = default;
+    ~condition_variable_any (void) = default;
 
     template<class L>
     void wait (L & lock)
     {
-        wait_impl(lock, INFINITE);
+        wait_impl(lock, kInfinite);
     }
 
     template<class L, class Predicate>
@@ -459,13 +491,12 @@ public:
     }
 
     template <class L, class Rep, class Period>
-    cv_status wait_for(L& lock, const std::chrono::duration<Rep, Period>& period)
+    cv_status wait_for(L& lock, const std::chrono::duration<Rep,Period>& period)
     {
         using namespace std::chrono;
-        auto time = duration_cast<milliseconds>(period).count();
-        if (time < 0)
-            time = 0;
-        bool result = wait_impl(lock, static_cast<DWORD>(time));
+        auto timeout = duration_cast<milliseconds>(period).count();
+        DWORD waittime = (timeout < kInfinite) ? ((timeout < 0) ? 0 : static_cast<DWORD>(timeout)) : (kInfinite - 1);
+        bool result = wait_impl(lock, waittime) || (timeout >= kInfinite);
         return result ? cv_status::no_timeout : cv_status::timeout;
     }
 

@@ -34,16 +34,37 @@
 #define STDMUTEX_RECURSION_CHECKS 1
 #endif
 
-#include <windows.h>
 #include <chrono>
 #include <system_error>
-#include <cstdio>
 #include <atomic>
 #include <mutex> //need for call_once()
-#include <cassert>
 
-//  Need for yield in spinlock and the implementation of invoke
-#include "mingw.thread.h"
+#if STDMUTEX_RECURSION_CHECKS || !defined(NDEBUG)
+#include <cstdio>
+#endif
+
+#include <sdkddkver.h>  //  Detect Windows version.
+
+#if (defined(__MINGW32__) && !defined(__MINGW64_VERSION_MAJOR))
+#pragma message "The Windows API that MinGW-w32 provides is not fully compatible\
+ with Microsoft's API. We'll try to work around this, but we can make no\
+ guarantees. This problem does not exist in MinGW-w64."
+#include <windows.h>    //  No further granularity can be expected.
+#else
+#if STDMUTEX_RECURSION_CHECKS
+#include <processthreadsapi.h>  //  For GetCurrentThreadId
+#endif
+#include <synchapi.h> //  For InitializeCriticalSection, etc.
+#include <errhandlingapi.h> //  For GetLastError
+#include <handleapi.h>
+#endif
+
+//  Need for the implementation of invoke
+#include "mingw.invoke.h"
+
+#if !defined(_WIN32_WINNT) || (_WIN32_WINNT < 0x0501)
+#error To use the MinGW-std-threads library, you will need to define the macro _WIN32_WINNT to be 0x0501 (Windows XP) or higher.
+#endif
 
 namespace mingw_stdthread
 {
@@ -137,6 +158,14 @@ struct _OwnerThread
 //    Though the Slim Reader-Writer (SRW) locks used here are not complete until
 //  Windows 7, implementing partial functionality in Vista will simplify the
 //  interaction with condition variables.
+
+//Define SRWLOCK_INIT.
+ 
+#if !defined(SRWLOCK_INIT)
+#pragma message "SRWLOCK_INIT macro is not defined. Defining automatically."
+#define SRWLOCK_INIT {0}
+#endif
+ 
 #if defined(_WIN32) && (WINVER >= _WIN32_WINNT_VISTA)
 namespace windows7
 {
@@ -146,22 +175,19 @@ class mutex
 //  Track locking thread for error checking.
 #if STDMUTEX_RECURSION_CHECKS
     friend class vista::condition_variable;
-    _OwnerThread mOwnerThread;
+    _OwnerThread mOwnerThread {};
 #endif
 public:
     typedef PSRWLOCK native_handle_type;
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wzero-as-null-pointer-constant"
-    constexpr mutex () noexcept : mHandle(SRWLOCK_INIT)
-#if STDMUTEX_RECURSION_CHECKS
-        , mOwnerThread()
-#endif
-    { }
+    constexpr mutex () noexcept : mHandle(SRWLOCK_INIT) { }
 #pragma GCC diagnostic pop
     mutex (const mutex&) = delete;
     mutex & operator= (const mutex&) = delete;
     void lock (void)
     {
+//  Note: Undefined behavior if called recursively.
 #if STDMUTEX_RECURSION_CHECKS
         DWORD self = mOwnerThread.checkOwnerBeforeLock();
 #endif
@@ -208,19 +234,18 @@ class mutex
 //  Track locking thread for error checking.
 #if STDMUTEX_RECURSION_CHECKS
     friend class vista::condition_variable;
-    _OwnerThread mOwnerThread;
+    _OwnerThread mOwnerThread {};
 #endif
 public:
     typedef PCRITICAL_SECTION native_handle_type;
-    constexpr mutex () noexcept : mHandle(), mState(2)
-#if STDMUTEX_RECURSION_CHECKS
-        , mOwnerThread()
-#endif
-    { }
+    constexpr mutex () noexcept : mHandle(), mState(2) { }
     mutex (const mutex&) = delete;
     mutex & operator= (const mutex&) = delete;
     ~mutex() noexcept
     {
+//    Undefined behavior if the mutex is held (locked) by any thread.
+//    Undefined behavior if a thread terminates while holding ownership of the
+//  mutex.
         DeleteCriticalSection(&mHandle);
     }
     void lock (void)
@@ -235,7 +260,7 @@ public:
             }
             if (state == 1)
             {
-                this_thread::yield();
+                Sleep(0);
                 state = mState.load(std::memory_order_acquire);
             }
         }
@@ -249,7 +274,6 @@ public:
     }
     void unlock (void)
     {
-        assert(mState.load(std::memory_order_relaxed) == 0);
 #if STDMUTEX_RECURSION_CHECKS
         mOwnerThread.checkSetOwnerBeforeUnlock();
 #endif
@@ -280,7 +304,7 @@ public:
         return &mHandle;
     }
 };
-}
+} //  Namespace "xp"
 #if (WINVER >= _WIN32_WINNT_WIN7)
 using windows7::mutex;
 #else
@@ -289,21 +313,21 @@ using xp::mutex;
 
 class recursive_timed_mutex
 {
-    bool try_lock_internal (DWORD ms)
+    static constexpr DWORD kWaitAbandoned = 0x00000080l;
+    static constexpr DWORD kWaitObject0 = 0x00000000l;
+    static constexpr DWORD kInfinite = 0xffffffffl;
+    inline bool try_lock_internal (DWORD ms) noexcept
     {
         DWORD ret = WaitForSingleObject(mHandle, ms);
-        using namespace std;
-        switch (ret)
+#ifndef NDEBUG
+        if (ret == kWaitAbandoned)
         {
-        case WAIT_TIMEOUT:
-            return false;
-        case WAIT_OBJECT_0:
-            return true;
-        case WAIT_ABANDONED:
-            throw system_error(make_error_code(errc::owner_dead));
-        default:
-            throw system_error(make_error_code(errc::protocol_error));
+            using namespace std;
+            fprintf(stderr, "FATAL: Thread terminated while holding a mutex.");
+            terminate();
         }
+#endif
+        return (ret == kWaitObject0) || (ret == kWaitAbandoned);
     }
 protected:
     HANDLE mHandle;
@@ -312,31 +336,41 @@ protected:
 //  access-control level as every other variable in the timed_mutex.
 #if STDMUTEX_RECURSION_CHECKS
     friend class vista::condition_variable;
-    _OwnerThread mOwnerThread;
+    _OwnerThread mOwnerThread {};
 #endif
 public:
     typedef HANDLE native_handle_type;
     native_handle_type native_handle() const {return mHandle;}
     recursive_timed_mutex(const recursive_timed_mutex&) = delete;
     recursive_timed_mutex& operator=(const recursive_timed_mutex&) = delete;
-    recursive_timed_mutex(): mHandle(CreateMutex(NULL, FALSE, NULL))
-#if STDMUTEX_RECURSION_CHECKS
-        , mOwnerThread()
-#endif
-    {}
+    recursive_timed_mutex(): mHandle(CreateMutex(NULL, FALSE, NULL)) {}
     ~recursive_timed_mutex()
     {
         CloseHandle(mHandle);
     }
     void lock()
     {
-        try_lock_internal(INFINITE);
+        DWORD ret = WaitForSingleObject(mHandle, kInfinite);
+//    If (ret == WAIT_ABANDONED), then the thread that held ownership was
+//  terminated. Behavior is undefined, but Windows will pass ownership to this
+//  thread.
+#ifndef NDEBUG
+        if (ret == kWaitAbandoned)
+        {
+            using namespace std;
+            fprintf(stderr, "FATAL: Thread terminated while holding a mutex.");
+            terminate();
+        }
+#endif
+        if ((ret != kWaitObject0) && (ret != kWaitAbandoned))
+        {
+            throw std::system_error(GetLastError(), std::system_category());
+        }
     }
     void unlock()
     {
-        using namespace std;
         if (!ReleaseMutex(mHandle))
-            throw system_error(make_error_code(errc::resource_deadlock_would_occur));
+            throw std::system_error(GetLastError(), std::system_category());
     }
     bool try_lock()
     {
@@ -346,8 +380,16 @@ public:
     bool try_lock_for(const std::chrono::duration<Rep,Period>& dur)
     {
         using namespace std::chrono;
-        DWORD timeout = (DWORD)duration_cast<milliseconds>(dur).count();
-        return try_lock_internal(timeout);
+        auto timeout = duration_cast<milliseconds>(dur).count();
+        while (timeout > 0)
+        {
+          constexpr auto kMaxStep = static_cast<decltype(timeout)>(kInfinite-1);
+          auto step = (timeout < kMaxStep) ? timeout : kMaxStep;
+          if (try_lock_internal(static_cast<DWORD>(step)))
+            return true;
+          timeout -= step;
+        }
+        return false;
     }
     template <class Clock, class Duration>
     bool try_lock_until(const std::chrono::time_point<Clock,Duration>& timeout_time)
@@ -361,6 +403,7 @@ public:
 class timed_mutex: recursive_timed_mutex
 {
 public:
+    timed_mutex() = default;
     timed_mutex(const timed_mutex&) = delete;
     timed_mutex& operator=(const timed_mutex&) = delete;
     void lock()
@@ -422,7 +465,7 @@ void call_once(once_flag& flag, Callable&& func, Args&&... args)
     if (flag.mHasRun.load(std::memory_order_acquire))
         return;
     lock_guard<decltype(flag.mMutex)> lock(flag.mMutex);
-    if (flag.mHasRun.load(std::memory_order_acquire))
+    if (flag.mHasRun.load(std::memory_order_relaxed))
         return;
     detail::invoke(std::forward<Callable>(func),std::forward<Args>(args)...);
     flag.mHasRun.store(true, std::memory_order_release);

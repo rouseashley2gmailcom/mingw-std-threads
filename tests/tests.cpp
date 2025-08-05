@@ -1,13 +1,31 @@
-#include "../mingw.thread.h"
-#include "../mingw.mutex.h"
-#include "../mingw.condition_variable.h"
-#include "../mingw.shared_mutex.h"
-#include "../mingw.future.h"
+#ifndef MINGW_STDTHREADS_GENERATED_STDHEADERS
+  #include <mingw.thread.h>
+  #include <mingw.mutex.h>
+  #include <mingw.condition_variable.h>
+  #include <mingw.shared_mutex.h>
+  #include <mingw.future.h>
+
+  #if defined(__cplusplus) && (__cplusplus >= 202002L)
+    #include <mingw.latch.h>
+  #endif
+
+#else
+  #include <thread>
+  #include <mutex>
+  #include <condition_variable>
+  #include <shared_mutex>
+  #include <future>
+
+  #if defined(__cplusplus) && (__cplusplus >= 202002L)
+    #include <latch>
+  #endif
+
+#endif
 #include <atomic>
 #include <cassert>
 #include <string>
 #include <iostream>
-#include <windows.h>
+#include <typeinfo>
 
 using namespace std;
 
@@ -21,10 +39,31 @@ std::mutex m;
 std::shared_mutex sm;
 std::condition_variable cv;
 std::condition_variable_any cv_any;
-#define LOG(fmtString,...) { printf(fmtString "\n", ##__VA_ARGS__); fflush(stdout); }
+
+std::atomic<unsigned long long> failure_count {0};
+template<class ... Args>
+void log_error (char const * fmtString, Args ...args) {
+  ++failure_count;
+  printf("%s", "ERROR: ");
+  printf(fmtString, args...);
+  printf("%s", "\n");
+  fflush(stdout);
+}
+
+
+template<class ... Args>
+void log (char const * fmtString, Args ...args) {
+  printf(fmtString, args...);
+  printf("%s", "\n");
+  fflush(stdout);
+}
+
 void test_call_once(int a, const char* str)
 {
-    LOG("test_call_once called with a=%d, str=%s", a, str);
+    static std::atomic_flag already_run = ATOMIC_FLAG_INIT;
+    if (already_run.test_and_set(std::memory_order_relaxed))
+      log_error("test_call_once was run at least twice.");
+    log("test_call_once called with a=%d, str=%s", a, str);
     this_thread::sleep_for(std::chrono::milliseconds(500));
 }
 
@@ -86,12 +125,12 @@ struct CustomAllocator
   typedef T value_type;
   T * allocate (size_t n)
   {
-    LOG("Used custom allocator to allocate %zu object(s).", n);
+    log("Used custom allocator to allocate %zu object(s).", n);
     return static_cast<T*>(std::malloc(n * sizeof(T)));
   }
   void deallocate (T * ptr, size_t n)
   {
-    LOG("Used custom allocator to deallocate %zu object(s).", n);
+    log("Used custom allocator to deallocate %zu object(s).", n);
     std::free(ptr);
   }
 };
@@ -126,7 +165,7 @@ void test_future ()
   static_assert(is_copy_assignable<shared_future<T> >::value,
                 "std::shared_future must be copy-assignable.");
 
-  LOG("\t%s","Making a few promises, and getting their futures...");
+  log("\tMaking a few promises, and getting their futures...");
   promise<T> promise_value, promise_exception, promise_broken, promise_late;
 
   future<T> future_value = promise_value.get_future();
@@ -136,26 +175,18 @@ void test_future ()
 
   try {
     future<T> impossible_future = promise_value.get_future();
-    LOG("WARNING: %s","Promise failed to detect that its future was already retrieved.");
+    log_error("Promise failed to detect that its future was already retrieved.");
   } catch(...) {
-    LOG("\t%s","Promise successfully prevented redundant future retrieval.");
+    log("\tPromise successfully prevented redundant future retrieval.");
   }
 
-  LOG("\t%s","Passing promises to a new thread...");
+  log("\tPassing promises to a new thread...");
   thread t ([](promise<T> p_value, promise<T> p_exception, promise<T>, promise<T> p_late)
     {
       this_thread::sleep_for(std::chrono::seconds(1));
-      try {
-        throw std::runtime_error("Thrown during the thread.");
-      } catch (...) {
-        p_late.set_exception_at_thread_exit(std::current_exception());
-      }
+      p_late.set_exception_at_thread_exit(std::make_exception_ptr(std::runtime_error("Thrown during the thread.")));
       test_future_set_value(p_value);
-      try {
-        throw std::runtime_error("Things happened as expected.");
-      } catch (...) {
-        p_exception.set_exception(std::current_exception());
-      }
+      p_exception.set_exception(std::make_exception_ptr(std::runtime_error("Things happened as expected.")));
       this_thread::sleep_for(std::chrono::seconds(2));
     },
     std::move(promise_value),
@@ -166,96 +197,199 @@ void test_future ()
 
   try {
     bool was_expected = test_future_get_value(future_value);
-    LOG("\tReceived %sexpected value.", (was_expected ? "" : "un"));
+    log("\tReceived %sexpected value.", (was_expected ? "" : "un"));
   } catch (...) {
-    LOG("WARNING: %s","Exception where there should be none!");
+    log_error("Exception where there should be none!");
     throw;
   }
   try {
     test_future_get_value(future_exception);
-    LOG("WARNING: %s","Got a value where there should be an exception!");
+    log_error("Got a value where there should be an exception!");
   } catch (std::exception & e) {
-    LOG("\tReceived an exception (\"%s\") as expected.", e.what());
+    log("\tReceived an exception (\"%s\") as expected.", e.what());
   }
 
-  LOG("\t%s", "Waiting for the thread to exit...");
+  log("\tWaiting for the thread to exit...");
   try {
     test_future_get_value(future_late);
-    LOG("WARNING: %s","Got a value where there should be an exception!");
+    log_error("Got a value where there should be an exception!");
   } catch (std::exception & e) {
-    LOG("\tReceived an exception (\"%s\") as expected.", e.what());
+    log("\tReceived an exception (\"%s\") as expected.", e.what());
   }
 
   try {
     test_future_get_value(future_broken);
-    LOG("WARNING: %s","Got a value where there should be an exception!");
+    log_error("Got a value where there should be an exception!");
   } catch (std::future_error & e) {
-    LOG("\tReceived a future_error (\"%s\") as expected.", e.what());
+    log("\tReceived a future_error (\"%s\") as expected.", e.what());
   }
 
-  LOG("\t%s", "Deferring a function...");
-  auto async_deferred = async(launch::deferred, [] (void) -> T
-    {
-      std::hash<std::thread::id> hasher;
-      LOG("\t\tDeferred function called on thread %zu", hasher(std::this_thread::get_id()));
-      if (!is_void<T>::value)
-        return T(test_int);
-    });
-  LOG("\t%s", "Calling a function asynchronously...");
-  auto async_async = async(launch::async, [] (void) -> T
-    {
-      std::hash<std::thread::id> hasher;
-      LOG("\t\tAsynchronous function called on thread %zu", hasher(std::this_thread::get_id()));
-      if (!is_void<T>::value)
-        return T(test_int);
-    });
-  LOG("\t%s", "Letting the implementation decide...");
-  auto async_either = async([] (thread::id other_id) -> T
-    {
-      std::hash<thread::id> hasher;
-      LOG("\t\tFunction called on thread %zu. Implementation chose %s execution.", hasher(this_thread::get_id()), (this_thread::get_id() == other_id) ? "deferred" : "asynchronous");
-      if (!is_void<T>::value)
-        return T(test_int);
-    }, this_thread::get_id());
+  { //  Part 1: Test whether `async` has correct return behavior.
+    log("\tDeferring a function...");
+    auto async_deferred = async(launch::deferred, [] (thread::id other_id) -> T
+      {
+        std::hash<std::thread::id> hasher;
+        log("\t\tDeferred function called on thread %zu (expected %zu)", hasher(std::this_thread::get_id()), hasher(other_id));
+        if (std::this_thread::get_id() != other_id)
+          throw std::logic_error("Test failed. Function should have been deferred, but was asynchronous.");
+        if (!is_void<T>::value)
+          return T(test_int);
+      }, this_thread::get_id());
+    log("\tCalling a function asynchronously...");
+    auto async_async = async(launch::async, [] (thread::id other_id) -> T
+      {
+        std::hash<std::thread::id> hasher;
+        log("\t\tAsynchronous function called on thread %zu (expected anything except %zu)", hasher(std::this_thread::get_id()), hasher(other_id));
+        if (std::this_thread::get_id() == other_id)
+          throw std::logic_error("Test failed. Function should have been asynchronous, but was deferred.");
+        if (!is_void<T>::value)
+          return T(test_int);
+      }, this_thread::get_id());
+    log("\tLetting the implementation decide...");
+    auto async_either = async([] (thread::id other_id) -> T
+      {
+        std::hash<thread::id> hasher;
+        log("\t\tFunction called on thread %zu. Implementation chose %s execution.", hasher(this_thread::get_id()), (this_thread::get_id() == other_id) ? "deferred" : "asynchronous");
+        if (!is_void<T>::value)
+          return T(test_int);
+      }, this_thread::get_id());
 
-  LOG("\t%s", "Fetching asynchronous result.");
-  test_future_get_value(async_async);
-  LOG("\t%s", "Fetching deferred result.");
-  test_future_get_value(async_deferred);
-  LOG("\t%s", "Fetching implementation-defined result.");
-  test_future_get_value(async_either);
+    if (async_deferred.wait_for(std::chrono::milliseconds(50)) != std::future_status::deferred)
+      log_error("Deferred future did not return deferred status.");
 
-  LOG("\t%s", "Testing async on pointer-to-member-function.");
+    log("\tFetching asynchronous result.");
+    test_future_get_value(async_async);
+    log("\tFetching deferred result.");
+    test_future_get_value(async_deferred);
+    log("\tFetching implementation-defined result.");
+    test_future_get_value(async_either);
+  }
+
+  { //  Part 2: Test waiting
+    log("\tCalling a make-work function asynchronously...");
+    auto async_async = async(launch::async, [] (void) noexcept -> T
+      {
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        if (!is_void<T>::value)
+          return T(test_int);
+      });
+
+    unsigned sleep_count = 0;
+    while (async_async.wait_for(std::chrono::milliseconds(50)) == std::future_status::timeout)
+    {
+      ++sleep_count;
+    }
+
+    if (sleep_count < 4)
+      log_error("Number of timeouts (%u) was signficantly less than expected (9).", sleep_count);
+    else
+      log("\tTimed out %u times. Should be close to 9.", sleep_count);
+  }
+
+  log("\tTesting async on pointer-to-member-function.");
   struct Helper
   {
     thread::id other_id;
     T call (void) const
     {
       std::hash<thread::id> hasher;
-      LOG("\t\tFunction called on thread %zu. Implementation chose %s execution.", hasher(this_thread::get_id()), (this_thread::get_id() == other_id) ? "deferred" : "asynchronous");
+      log("\t\tFunction called on thread %zu. Implementation chose %s execution.", hasher(this_thread::get_id()), (this_thread::get_id() == other_id) ? "deferred" : "asynchronous");
       if (!is_void<T>::value)
         return T(test_int);
     }
   } test_class { this_thread::get_id() };
   auto async_member = async(Helper::call, test_class);
-  LOG("\t%s", "Fetching result.");
+  log("\tFetching result.");
   test_future_get_value(async_member);
 }
 
+#if defined(__cplusplus) && (__cplusplus >= 202002L)
+
+void test_latch ()
+{
+  std::latch latch(5);
+
+  std::thread thread1([&latch] { latch.wait(); });
+  std::thread thread2([&latch] { latch.arrive_and_wait(2); });
+
+  latch.count_down();
+
+  log("Testing count_down...");
+  latch.count_down(2);
+
+  thread1.join();
+  thread2.join();
+}
+
+void test_latch_release_wait ()
+{
+  std::latch latch(5);
+
+  std::thread thread1([&latch] { latch.wait(); });
+  std::thread thread2([&latch] { latch.arrive_and_wait(2); });
+
+  latch.count_down();
+
+  log("Testing release_wait...");
+  latch.arrive_and_wait(2);
+
+  log("Testing try_wait...");
+  if (!latch.try_wait())
+  {
+    log_error("try_wait did not return true even though the internal counter should have reached 0");
+  }
+
+  thread1.join();
+  thread2.join();
+}
+
+void test_latch_noexcept()
+{
+  static_assert(noexcept(std::latch::max()));
+  static_assert(noexcept(std::latch::latch()));
+  static_assert(noexcept(std::latch::try_wait()));
+  static_assert(noexcept(std::latch::arrive_and_wait()));
+}
+
+#endif // defined(__cplusplus) && (__cplusplus >= 202002L)
+
+#define TEST_SL_MV_CPY(ClassName) \
+    static_assert(std::is_standard_layout<ClassName>::value, \
+                  "ClassName does not satisfy concept StandardLayoutType."); \
+    static_assert(!std::is_move_constructible<ClassName>::value, \
+                  "ClassName must not be move-constructible."); \
+    static_assert(!std::is_move_assignable<ClassName>::value, \
+                  "ClassName must not be move-assignable."); \
+    static_assert(!std::is_copy_constructible<ClassName>::value, \
+                  "ClassName must not be copy-constructible."); \
+    static_assert(!std::is_copy_assignable<ClassName>::value, \
+                  "ClassName must not be copy-assignable.");
+
 int main()
 {
-    if (!is_standard_layout<mutex>::value)
-      LOG("WARNING: Class std::%s does not satisfy concept StandardLayoutType.","mutex");
-    if (!is_standard_layout<recursive_mutex>::value)
-      LOG("WARNING: Class std::%s does not satisfy concept StandardLayoutType.","recursive_mutex");
-    if (!is_standard_layout<timed_mutex>::value)
-      LOG("WARNING: Class std::%s does not satisfy concept StandardLayoutType.","timed_mutex");
-    if (!is_standard_layout<recursive_timed_mutex>::value)
-      LOG("WARNING: Class std::%s does not satisfy concept StandardLayoutType.","recursive_timed_mutex");
-    if (!is_standard_layout<shared_mutex>::value)
-      LOG("WARNING: Class std::%s does not satisfy concept StandardLayoutType.","shared_mutex");
-    if (!is_standard_layout<shared_timed_mutex>::value)
-      LOG("WARNING: Class std::%s does not satisfy concept StandardLayoutType.","shared_timed_mutex");
+#ifdef MINGW_STDTHREADS_GENERATED_STDHEADERS
+    std::cout << "Using cmake-generated stdheaders, ";
+#endif
+    static_assert(std::is_trivially_copyable<thread::id>::value,
+                  "thread::id must be trivially copyable.");
+
+    TEST_SL_MV_CPY(mutex)
+    TEST_SL_MV_CPY(recursive_mutex)
+    TEST_SL_MV_CPY(timed_mutex)
+    TEST_SL_MV_CPY(recursive_timed_mutex)
+    TEST_SL_MV_CPY(shared_mutex)
+    TEST_SL_MV_CPY(shared_timed_mutex)
+    TEST_SL_MV_CPY(condition_variable)
+    TEST_SL_MV_CPY(condition_variable_any)
+    static_assert(!std::is_move_constructible<once_flag>::value,
+                  "once_flag must not be move-constructible.");
+    static_assert(!std::is_move_assignable<once_flag>::value,
+                  "once_flag must not be move-assignable.");
+    static_assert(!std::is_copy_constructible<once_flag>::value,
+                  "once_flag must not be copy-constructible.");
+    static_assert(!std::is_copy_assignable<once_flag>::value,
+                  "once_flag must not be copy-assignable.");
+
 //    With C++ feature level and target Windows version potentially affecting
 //  behavior, make this information visible.
     {
@@ -283,16 +417,43 @@ int main()
     }
 
     {
-        LOG("%s","Testing serialization and hashing for thread::id...");
+        log("Testing serialization and hashing for thread::id...");
         std::cout << "Serialization:\t" << this_thread::get_id() << "\n";
         std::hash<thread::id> hasher;
         std::cout << "Hash:\t" << hasher(this_thread::get_id()) << "\n";
     }
+
+//  Regression test: Thread must copy any argument that is passed by value.
+    {
+        std::vector<std::thread> loop_threads;
+        std::atomic<int> i_vals_touched [4];// { 0, 0, 0, 0 };
+        for (int i = 0; i < 4; ++i)
+            i_vals_touched[i].store(0, std::memory_order_relaxed);
+        for (int i = 0; i < 4; ++i)
+        {
+            loop_threads.push_back(std::thread([&](int c)
+                {
+                    log("For-loop test thread got value: %i", c);
+                    i_vals_touched[c].fetch_add(1, std::memory_order_relaxed);
+                }, i));
+        }
+        for (std::thread & thr : loop_threads)
+            thr.join();
+        for (int i = 0; i < 4; ++i)
+        {
+            if (i_vals_touched[i] != 1)
+            {
+                log_error("Threads are not copying arguments!");
+                return 1;
+            }
+        }
+    }
+
     std::thread t([](TestMove&& a, const char* b, int c) mutable
     {
         try
         {
-            LOG("%s","Worker thread started, sleeping for a while...");
+            log("Worker thread started, sleeping for a while...");
 //  Thread might move the string more than once.
             assert(a.mStr.substr(0, 15) == "move test moved");
             assert(!strcmp(b, "test message"));
@@ -302,7 +463,7 @@ int main()
             {
                 lock_guard<mutex> lock(m);
                 cond = 1;
-                LOG("%s","Notifying condvar");
+                log("Notifying condvar");
                 cv.notify_all();
             }
 
@@ -310,7 +471,7 @@ int main()
             {
                 lock_guard<decltype(sm)> lock(sm);
                 cond = 2;
-                LOG("%s","Notifying condvar");
+                log("Notifying condvar");
                 cv_any.notify_all();
             }
 
@@ -318,68 +479,77 @@ int main()
             {
                 lock_guard<decltype(sm)> lock(sm);
                 cond = 3;
-                LOG("%s","Notifying condvar");
+                log("Notifying condvar");
                 cv_any.notify_all();
             }
 
-            LOG("%s","Worker thread finishing");
+            log("Worker thread finishing");
         }
         catch(std::exception& e)
         {
-            printf("EXCEPTION in worker thread: %s\n", e.what());
+            log_error("EXCEPTION in worker thread: %s\n", e.what());
         }
     },
     TestMove("move test"), "test message", -20);
     try
     {
-      LOG("%s","Main thread: Locking mutex, waiting on condvar...");
+      log("Main thread: Locking mutex, waiting on condvar...");
       {
           std::unique_lock<decltype(m)> lk(m);
           cv.wait(lk, []{ return cond >= 1;} );
-          LOG("condvar notified, cond = %d", cond);
+          log("condvar notified, cond = %d", cond);
           assert(lk.owns_lock());
       }
-      LOG("%s","Main thread: Locking shared_mutex, waiting on condvar...");
+      log("Main thread: Locking shared_mutex, waiting on condvar...");
       {
           std::unique_lock<decltype(sm)> lk(sm);
           cv_any.wait(lk, []{ return cond >= 2;} );
-          LOG("condvar notified, cond = %d", cond);
+          log("condvar notified, cond = %d", cond);
           assert(lk.owns_lock());
       }
-      LOG("%s","Main thread: Locking shared_mutex in shared mode, waiting on condvar...");
+      log("Main thread: Locking shared_mutex in shared mode, waiting on condvar...");
       {
           std::shared_lock<decltype(sm)> lk(sm);
           cv_any.wait(lk, []{ return cond >= 3;} );
-          LOG("condvar notified, cond = %d", cond);
+          log("condvar notified, cond = %d", cond);
           assert(lk.owns_lock());
       }
-      LOG("%s","Main thread: Waiting on worker join...");
+      log("Main thread: Waiting on worker join...");
 
       t.join();
-      LOG("%s","Main thread: Worker thread joined");
+      log("Main thread: Worker thread joined");
       fflush(stdout);
     }
     catch(std::exception& e)
     {
-        LOG("EXCEPTION in main thread: %s", e.what());
+        log_error("EXCEPTION in main thread: %s", e.what());
     }
     once_flag of;
     call_once(of, test_call_once, 1, "test");
     call_once(of, test_call_once, 1, "ERROR! Should not be called second time");
-    LOG("%s","Test complete");
+    log("Test complete");
 
     {
-      LOG("%s","Testing implementation of <future>...");
+      log("Testing implementation of <future>...");
       test_future<int>();
       test_future<void>();
       test_future<int &>();
       test_future<int const &>();
       test_future<int volatile &>();
       test_future<int const volatile &>();
-      LOG("%s","Testing <future>'s use of allocators. Should allocate, then deallocate.");
+      log("Testing <future>'s use of allocators. Should allocate, then deallocate.");
       promise<int> allocated_promise (std::allocator_arg, CustomAllocator<unsigned>());
       allocated_promise.set_value(7);
     }
 
-    return 0;
+#if defined(__cplusplus) && (__cplusplus >= 202002L)
+    {
+      log("Testing implementation of <latch>...");
+      test_latch();
+      test_latch_release_wait();
+      test_latch_noexcept();
+    }
+#endif
+
+    return failure_count.load() != 0;
 }

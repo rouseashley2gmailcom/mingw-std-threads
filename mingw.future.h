@@ -23,12 +23,27 @@
 
 #include <cassert>
 #include <vector>
-#include <utility>  //  For std::pair
+#include <utility>        //  For std::pair
 #include <type_traits>
 #include <memory>
-#include "mingw.thread.h"
+#include <functional>     //  For std::hash
+
+#include "mingw.thread.h" //  Start new threads, and use invoke.
+
+//  Mutexes and condition variables are used explicitly.
 #include "mingw.mutex.h"
 #include "mingw.condition_variable.h"
+
+#if (defined(__MINGW32__) && !defined(__MINGW64_VERSION_MAJOR))
+#pragma message "The Windows API that MinGW-w32 provides is not fully compatible\
+ with Microsoft's API. We'll try to work around this, but we can make no\
+ guarantees. This problem does not exist in MinGW-w64."
+#include <windows.h>    //  No further granularity can be expected.
+#else
+#include <synchapi.h>
+#include <handleapi.h>
+#include <processthreadsapi.h>
+#endif
 
 //  Note:
 //    std::shared_ptr is the natural choice for this. However, a custom
@@ -55,12 +70,12 @@ struct FutureStatic
   enum Type : uint_fast8_t
   {
     kUndecided = 0x00,
-    kDeferred = 0x05,
-    kValue = 0x02,
-    kException = 0x03,
-    kSetFlag = 0x02,
-    kTypeMask = 0x03,
-    kReadyFlag = 0x04
+    kValueFlag = 0x01,
+    kExceptionFlag = 0x02,
+    kDeferredFlag = 0x04, //  Needs special handling. Must not wait.
+    kReadyFlag = 0x10,    //  Results are ready for consumption
+    kTypeMask = 0x07,
+    kNoWaitMask = 0x14    //  Indicates that waits should immediately exit.
   };
 
   static std::vector<std::pair<mutex, condition_variable> > sync_pool;
@@ -173,10 +188,10 @@ struct FutureBase : public FutureStatic<true>
 #endif
 //    If there's already a value or exception, don't do any extraneous
 //  synchronization. The `get()` method will do that for us.
-    if (mState->mType.load(std::memory_order_relaxed) & kReadyFlag)
+    if (mState->mType.load(std::memory_order_relaxed) & Type::kNoWaitMask)
       return;
     get_condition_variable().wait(lock, [this](void)->bool {
-      return mState->mType.load(std::memory_order_relaxed) & kReadyFlag;
+      return mState->mType.load(std::memory_order_relaxed) & Type::kNoWaitMask;
     });
   }
 
@@ -188,12 +203,12 @@ struct FutureBase : public FutureStatic<true>
       throw future_error(future_errc::no_state);
 #endif
     auto current_state = mState->mType.load(std::memory_order_relaxed);
-    if (current_state & kReadyFlag)
-      return (current_state == kDeferred) ? future_status::deferred : future_status::ready;
+    if (current_state & Type::kNoWaitMask)
+      return (current_state & Type::kDeferredFlag) ? future_status::deferred : future_status::ready;
     std::unique_lock<mutex> lock { get_mutex() };
     if (get_condition_variable().wait_for(lock, dur,
           [this](void)->bool {
-            return mState->mType.load(std::memory_order_relaxed) & kReadyFlag;
+            return mState->mType.load(std::memory_order_relaxed) & Type::kNoWaitMask;
           }))
       return future_status::ready;
     else
@@ -225,7 +240,7 @@ struct FutureState : public FutureStateBase
   }
 
   FutureState (std::function<void(void)> && deferred_function)
-    : FutureStateBase(Type::kDeferred), mFunction(std::move(deferred_function))
+    : FutureStateBase(Type::kDeferredFlag), mFunction(std::move(deferred_function))
   {
   }
 
@@ -237,47 +252,49 @@ struct FutureState : public FutureStateBase
   template<class Arg>
   void set_value (Arg && arg)
   {
-    assert(!(mType.load(std::memory_order_relaxed) & Type::kSetFlag));
+    assert(!(mType.load(std::memory_order_relaxed) & Type::kReadyFlag));
     new(&mObject) T (std::forward<Arg>(arg));
-    mType.store(Type::kValue | Type::kReadyFlag, std::memory_order_release);
+    mType.store(Type::kValueFlag | Type::kReadyFlag, std::memory_order_release);
   }
   template<class Arg>
   void set_exception (Arg && arg)
   {
-    assert(!(mType.load(std::memory_order_relaxed) & Type::kSetFlag));
+    assert(!(mType.load(std::memory_order_relaxed) & Type::kReadyFlag));
     new(&mException) std::exception_ptr (std::forward<Arg>(arg));
-    mType.store(Type::kException | Type::kReadyFlag, std::memory_order_release);
+    mType.store(Type::kExceptionFlag | Type::kReadyFlag, std::memory_order_release);
   }
 //  These overloads set value/exception, but don't make it ready.
   template<class Arg>
   void set_value (Arg && arg, bool)
   {
-    assert(!(mType.load(std::memory_order_relaxed) & Type::kSetFlag));
+    assert(!(mType.load(std::memory_order_relaxed) & Type::kReadyFlag));
     new(&mObject) T (std::forward<Arg>(arg));
-    mType.store(Type::kValue, std::memory_order_release);
+    mType.store(Type::kValueFlag, std::memory_order_release);
   }
   template<class Arg>
   void set_exception (Arg && arg, bool)
   {
-    assert(!(mType.load(std::memory_order_relaxed) & Type::kSetFlag));
+    assert(!(mType.load(std::memory_order_relaxed) & Type::kReadyFlag));
     new(&mException) std::exception_ptr (std::forward<Arg>(arg));
-    mType.store(Type::kException, std::memory_order_release);
+    mType.store(Type::kExceptionFlag, std::memory_order_release);
   }
  //private:
   ~FutureState (void)
   {
-    switch (mType.load(std::memory_order_acquire) & Type::kTypeMask)
+    auto type = mType.load(std::memory_order_acquire);
+    switch (type & Type::kTypeMask)
     {
-    case Type::kDeferred & Type::kTypeMask:
+    case Type::kDeferredFlag:
       mFunction.~function();
       break;
-    case Type::kValue:
+    case Type::kValueFlag:
       mObject.~T();
       break;
-    case Type::kException:
+    case Type::kExceptionFlag:
       mException.~exception_ptr();
       break;
-    default:;
+    default:
+      assert(type == Type::kUndecided);
     }
   }
 };
@@ -371,30 +388,32 @@ class future : mingw_stdthread::detail::FutureBase
   T const & get (void) const
   {
     wait();
-    if (mState->mType.load(std::memory_order_acquire) == (kValue | kReadyFlag))
+    auto type = mState->mType.load(std::memory_order_acquire);
+    if (type == (Type::kValueFlag | Type::kReadyFlag))
       return static_cast<state_type *>(mState)->mObject;
     else
     {
-      assert(mState->mType.load(std::memory_order_relaxed) == (kException | kReadyFlag));
+      assert(type == (Type::kExceptionFlag | Type::kReadyFlag));
       std::rethrow_exception(static_cast<state_type *>(mState)->mException);
     }
   }
 
-  shared_future<T> share (void) noexcept
-  {
-    return std::move(shared_future<T>(std::move(*this)));
-  }
+  shared_future<T> share (void) noexcept;
 
   void wait (void) const
   {
+    auto state = mState->mType.load(std::memory_order_relaxed);
+    if (state & Type::kReadyFlag)
+      return;
     std::unique_lock<mingw_stdthread::mutex> lock { get_mutex() };
     FutureBase::wait(lock);
-    if (mState->mType.load(std::memory_order_acquire) == kDeferred)
+    if (mState->mType.load(std::memory_order_acquire) & Type::kDeferredFlag)
     {
       state_type * ptr = static_cast<state_type *>(mState);
       decltype(ptr->mFunction) func = std::move(ptr->mFunction);
       ptr->mFunction.~function();
       func();
+      lock.unlock();
       ptr->get_condition_variable().notify_all();
     }
   }
@@ -426,7 +445,7 @@ class shared_future : future<T>
   }
 
   shared_future (shared_future<T> const & source) noexcept(__cplusplus >= 201703L)
-    : future<T>(source.mState)
+    : future<T>(static_cast<state_type *>(source.mState))
   {
     future<T>::mState->increment_references();
   }
@@ -464,25 +483,22 @@ class promise : mingw_stdthread::detail::FutureBase
   {
     if (!valid())
       throw future_error(future_errc::no_state);
-    if (mState->mType.load(std::memory_order_relaxed) & kSetFlag)
+    if (mState->mType.load(std::memory_order_relaxed) & Type::kReadyFlag)
       throw future_error(future_errc::promise_already_satisfied);
   }
 
   void check_abandon (void)
   {
-    if (valid() && !(mState->mType.load(std::memory_order_relaxed) & kSetFlag))
+    if (valid() && !(mState->mType.load(std::memory_order_relaxed) & Type::kReadyFlag))
     {
-      try {
-        throw future_error(future_errc::broken_promise);
-      } catch (...) {
-        set_exception(std::current_exception());
-      }
+      set_exception(std::make_exception_ptr(future_error(future_errc::broken_promise)));
     }
   }
 /// \bug Might throw more exceptions than specified by the standard...
 //  Need OS support for this...
   void make_ready_at_thread_exit (void)
   {
+    static constexpr DWORD kInfinite = 0xffffffffl;
 //  Need to turn the pseudohandle from GetCurrentThread() into a true handle...
     HANDLE thread_handle;
     BOOL success = DuplicateHandle(GetCurrentProcess(),
@@ -507,12 +523,12 @@ class promise : mingw_stdthread::detail::FutureBase
           }
           ptr->get_condition_variable().notify_all();
 //  Wait for the original thread to die.
-          WaitForSingleObject(thread_handle, INFINITE);
+          WaitForSingleObject(thread_handle, kInfinite);
           CloseHandle(thread_handle);
 
           {
             std::lock_guard<mingw_stdthread::mutex> guard (ptr->get_mutex());
-            ptr->mType.fetch_or(kReadyFlag, std::memory_order_relaxed);
+            ptr->mType.fetch_or(Type::kReadyFlag, std::memory_order_relaxed);
           }
           ptr->get_condition_variable().notify_all();
 
@@ -613,9 +629,8 @@ class promise : mingw_stdthread::detail::FutureBase
   void set_value (T const & value)
   {
     {
-      std::unique_lock<mingw_stdthread::mutex> lock { get_mutex() };
+      std::lock_guard<mingw_stdthread::mutex> lock { get_mutex() };
       check_before_set();
-//    std::unique_lock<mutex> lock {detail::FutureStatic<true>::get_mutex(state_ptr_.get()); };
       static_cast<state_type *>(mState)->set_value(value);
     }
     get_condition_variable().notify_all();
@@ -624,7 +639,7 @@ class promise : mingw_stdthread::detail::FutureBase
   void set_value (T && value)
   {
     {
-      std::unique_lock<mingw_stdthread::mutex> lock { get_mutex() };
+      std::lock_guard<mingw_stdthread::mutex> lock { get_mutex() };
       check_before_set();
       static_cast<state_type *>(mState)->set_value(std::move(value));
     }
@@ -634,9 +649,8 @@ class promise : mingw_stdthread::detail::FutureBase
   void set_value_at_thread_exit (T const & value)
   {
     {
-      std::unique_lock<mingw_stdthread::mutex> lock { get_mutex() };
+      std::lock_guard<mingw_stdthread::mutex> lock { get_mutex() };
       check_before_set();
-//    std::unique_lock<mutex> lock {detail::FutureStatic<true>::get_mutex(state_ptr_.get()); };
       static_cast<state_type *>(mState)->set_value(value, false);
     }
     make_ready_at_thread_exit();
@@ -645,7 +659,7 @@ class promise : mingw_stdthread::detail::FutureBase
   void set_value_at_thread_exit (T && value)
   {
     {
-      std::unique_lock<mingw_stdthread::mutex> lock { get_mutex() };
+      std::lock_guard<mingw_stdthread::mutex> lock { get_mutex() };
       check_before_set();
       static_cast<state_type *>(mState)->set_value(std::move(value), false);
     }
@@ -655,7 +669,7 @@ class promise : mingw_stdthread::detail::FutureBase
   void set_exception (std::exception_ptr eptr)
   {
     {
-      std::unique_lock<mingw_stdthread::mutex> lock { get_mutex() };
+      std::lock_guard<mingw_stdthread::mutex> lock { get_mutex() };
       check_before_set();
       static_cast<state_type *>(mState)->set_exception(eptr);
     }
@@ -665,7 +679,7 @@ class promise : mingw_stdthread::detail::FutureBase
   void set_exception_at_thread_exit (std::exception_ptr eptr)
   {
     {
-      std::unique_lock<mingw_stdthread::mutex> lock { get_mutex() };
+      std::lock_guard<mingw_stdthread::mutex> lock { get_mutex() };
       check_before_set();
       static_cast<state_type *>(mState)->set_exception(eptr, false);
     }
@@ -724,16 +738,6 @@ class shared_future<T&> : shared_future<void *>
     return *static_cast<T *>(Base::get());
   }
 
-  /*shared_future (void) noexcept = default;
-
-  shared_future (shared_future<T&> && source) noexcept = default;
-
-  shared_future<T&> & operator= (shared_future<T&> && source) noexcept = default;
-
-  shared_future (shared_future<T&> const & source) noexcept(__cplusplus >= 201703L) = default;
-
-  shared_future<T&> & operator= (shared_future<T&> const & source) noexcept(__cplusplus >= 201703L) = default;*/
-
   shared_future (future<T&> && source) noexcept
     : Base(std::move(source))
   {
@@ -747,12 +751,6 @@ class shared_future<T&> : shared_future<void *>
 
   ~shared_future (void) = default;
 };
-
-template<class T>
-shared_future<T&> future<T&>::share (void) noexcept
-{
-  return std::move(shared_future<T&>(std::move(*this)));
-}
 
 template<class T>
 class promise<T&> : private promise<void *>
@@ -868,10 +866,21 @@ class shared_future<void> : shared_future<mingw_stdthread::detail::Empty>
   ~shared_future (void) = default;
 };
 
-shared_future<void> future<void>::share (void) noexcept
+inline shared_future<void> future<void>::share (void) noexcept
 {
-  return std::move(shared_future<void>(std::move(*this)));
-  //return future<Empty>::share();
+  return shared_future<void>(std::move(*this));
+}
+
+template<class T>
+shared_future<T> future<T>::share (void) noexcept
+{
+  return shared_future<T>(std::move(*this));
+}
+
+template<class T>
+shared_future<T&> future<T&>::share (void) noexcept
+{
+  return shared_future<T&>(std::move(*this));
 }
 
 template<>
@@ -917,13 +926,8 @@ void swap(promise<T> & lhs, promise<T> & rhs) noexcept
 {
   lhs.swap(rhs);
 }
-
-template<class T, class Alloc>
-struct uses_allocator<promise<T>, Alloc> : std::true_type
-{
-};
-
 } //  Namespace "std"
+
 namespace mingw_stdthread
 {
 namespace detail
@@ -935,7 +939,7 @@ struct StorageHelper
   static void store_deferred (FutureState<Ret> * state_ptr, Func && func, Args&&... args)
   {
     try {
-      state_ptr->set_value(mingw_stdthread::detail::invoke(std::forward<Func>(func), std::forward<Args>(args)...));
+      state_ptr->set_value(invoke(std::forward<Func>(func), std::forward<Args>(args)...));
     } catch (...) {
       state_ptr->set_exception(std::current_exception());
     }
@@ -943,9 +947,14 @@ struct StorageHelper
   template<class Func, class ... Args>
   static void store (FutureState<Ret> * state_ptr, Func && func, Args&&... args)
   {
-    std::unique_lock<mingw_stdthread::mutex> lock { state_ptr->get_mutex() };
-    store_deferred(state_ptr, std::forward<Func>(func), std::forward<Args>(args)...);
-    lock.unlock();
+    try {
+      auto result = invoke(std::forward<Func>(func), std::forward<Args>(args)...);
+      std::lock_guard<mingw_stdthread::mutex> lock { state_ptr->get_mutex() };  //  Reveal the results of the above action to
+      state_ptr->set_value(std::move(result));
+    } catch (...) {
+      std::lock_guard<mingw_stdthread::mutex> lock { state_ptr->get_mutex() };  //  Reveal the results of the above action to
+      state_ptr->set_exception(std::current_exception());
+    }
     state_ptr->get_condition_variable().notify_all();
   }
 };
@@ -958,8 +967,7 @@ struct StorageHelper<Ref&>
   {
     try {
       typedef typename std::remove_cv<Ref>::type Ref_non_cv;
-      //Ref & rf = std::forward<Func>(func)(std::forward<Args>(args)...);
-      Ref & rf = mingw_stdthread::detail::invoke(std::forward<Func>(func), std::forward<Args>(args)...);
+      Ref & rf = invoke(std::forward<Func>(func), std::forward<Args>(args)...);
       state_ptr->set_value(const_cast<Ref_non_cv *>(std::addressof(rf)));
     } catch (...) {
       state_ptr->set_exception(std::current_exception());
@@ -968,9 +976,15 @@ struct StorageHelper<Ref&>
   template<class Func, class ... Args>
   static void store (FutureState<void*> * state_ptr, Func && func, Args&&... args)
   {
-    std::unique_lock<mingw_stdthread::mutex> lock { state_ptr->get_mutex() };
-    store_deferred(state_ptr, std::forward<Func>(func), std::forward<Args>(args)...);
-    lock.unlock();
+    try {
+      typedef typename std::remove_cv<Ref>::type Ref_non_cv;
+      Ref & rf = invoke(std::forward<Func>(func), std::forward<Args>(args)...);
+      std::lock_guard<mingw_stdthread::mutex> lock { state_ptr->get_mutex() };
+      state_ptr->set_value(const_cast<Ref_non_cv *>(std::addressof(rf)));
+    } catch (...) {
+      std::lock_guard<mingw_stdthread::mutex> lock { state_ptr->get_mutex() };
+      state_ptr->set_exception(std::current_exception());
+    }
     state_ptr->get_condition_variable().notify_all();
   }
 };
@@ -982,8 +996,7 @@ struct StorageHelper<void>
   static void store_deferred (FutureState<Empty> * state_ptr, Func && func, Args&&... args)
   {
     try {
-      //std::forward<Func>(func)(std::forward<Args>(args)...);
-      mingw_stdthread::detail::invoke(std::forward<Func>(func), std::forward<Args>(args)...);
+      invoke(std::forward<Func>(func), std::forward<Args>(args)...);
       state_ptr->set_value(Empty{});
     } catch (...) {
       state_ptr->set_exception(std::current_exception());
@@ -992,9 +1005,14 @@ struct StorageHelper<void>
   template<class Func, class ... Args>
   static void store (FutureState<Empty> * state_ptr, Func && func, Args&&... args)
   {
-    std::unique_lock<mingw_stdthread::mutex> lock { state_ptr->get_mutex() };
-    store_deferred(state_ptr, std::forward<Func>(func), std::forward<Args>(args)...);
-    lock.unlock();
+    try {
+      invoke(std::forward<Func>(func), std::forward<Args>(args)...);
+      std::lock_guard<mingw_stdthread::mutex> lock { state_ptr->get_mutex() };
+      state_ptr->set_value(Empty{});
+    } catch (...) {
+      std::lock_guard<mingw_stdthread::mutex> lock { state_ptr->get_mutex() };
+      state_ptr->set_exception(std::current_exception());
+    }
     state_ptr->get_condition_variable().notify_all();
   }
 };
@@ -1084,7 +1102,6 @@ std::future<__async_result_of<Function, Args...> >
     bound->ptr = state_ptr;
   }
   assert(state_ptr != nullptr);
-  //future<result_type> result { state_ptr };
   return future<result_type> { state_ptr };
 }
 
@@ -1105,12 +1122,12 @@ void swap(mingw_stdthread::promise<T> & lhs, mingw_stdthread::promise<T> & rhs) 
 {
   lhs.swap(rhs);
 }
-
-template<class T, class Alloc>
-struct uses_allocator<mingw_stdthread::promise<T>, Alloc> : std::true_type
-{
-};
 #endif
 } //  Namespace
+
+template<class T, class Alloc>
+struct std::uses_allocator<mingw_stdthread::promise<T>, Alloc> : ::std::true_type
+{
+};
 
 #endif // MINGW_FUTURE_H_

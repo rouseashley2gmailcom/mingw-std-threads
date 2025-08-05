@@ -27,154 +27,96 @@
 //  Use the standard classes for std::, if available.
 #include <thread>
 
-#include <windows.h>
-#include <functional>
-#include <memory>
-#include <chrono>
-#include <system_error>
-#include <cerrno>
-#include <ostream>
-#include <process.h>
-#include <ostream>
-#include <type_traits>
+#include <cstddef>      //  For std::size_t
+#include <cerrno>       //  Detect error type.
+#include <exception>    //  For std::terminate
+#include <system_error> //  For std::system_error
+#include <functional>   //  For std::hash
+#include <tuple>        //  For std::tuple
+#include <chrono>       //  For sleep timing.
+#include <memory>       //  For std::unique_ptr
+#include <iosfwd>       //  Stream output for thread ids.
+#include <utility>      //  For std::swap, std::forward
+
+#include "mingw.invoke.h"
+
+#if (defined(__MINGW32__) && !defined(__MINGW64_VERSION_MAJOR))
+#pragma message "The Windows API that MinGW-w32 provides is not fully compatible\
+ with Microsoft's API. We'll try to work around this, but we can make no\
+ guarantees. This problem does not exist in MinGW-w64."
+#include <windows.h>    //  No further granularity can be expected.
+#else
+#include <synchapi.h>   //  For WaitForSingleObject
+#include <handleapi.h>  //  For CloseHandle, etc.
+#include <sysinfoapi.h> //  For GetNativeSystemInfo
+#include <processthreadsapi.h>  //  For GetCurrentThreadId
+#endif
+#include <process.h>  //  For _beginthreadex
 
 #ifndef NDEBUG
 #include <cstdio>
 #endif
 
-//instead of INVALID_HANDLE_VALUE _beginthreadex returns 0
+#if !defined(_WIN32_WINNT) || (_WIN32_WINNT < 0x0501)
+#error To use the MinGW-std-threads library, you will need to define the macro _WIN32_WINNT to be 0x0501 (Windows XP) or higher.
+#endif
+
+//  Instead of INVALID_HANDLE_VALUE, _beginthreadex returns 0.
 namespace mingw_stdthread
 {
 namespace detail
 {
-//  For compatibility, implement std::invoke for C++11 and C++14
-#if __cplusplus < 201703L
-  template<bool PMemFunc, bool PMemData>
-  struct Invoker
-  {
-    template<class F, class... Args>
-    inline static typename std::result_of<F(Args...)>::type invoke (F&& f, Args&&... args)
-    {
-      return std::forward<F>(f)(std::forward<Args>(args)...);
-    }
-  };
-  template<bool>
-  struct InvokerHelper;
-
-  template<>
-  struct InvokerHelper<false>
-  {
-    template<class T1>
-    inline static auto get (T1&& t1) -> decltype(*std::forward<T1>(t1))
-    {
-      return *std::forward<T1>(t1);
-    }
-
-    template<class T1>
-    inline static auto get (const std::reference_wrapper<T1>& t1) -> decltype(t1.get())
-    {
-      return t1.get();
-    }
-  };
-
-  template<>
-  struct InvokerHelper<true>
-  {
-    template<class T1>
-    inline static auto get (T1&& t1) -> decltype(std::forward<T1>(t1))
-    {
-      return std::forward<T1>(t1);
-    }
-  };
-
-  template<>
-  struct Invoker<true, false>
-  {
-    template<class T, class F, class T1, class... Args>
-    inline static auto invoke (F T::* f, T1&& t1, Args&&... args) ->\
-      decltype((InvokerHelper<std::is_base_of<T,typename std::decay<T1>::type>::value>::get(std::forward<T1>(t1)).*f)(std::forward<Args>(args)...))
-    {
-      return (InvokerHelper<std::is_base_of<T,typename std::decay<T1>::type>::value>::get(std::forward<T1>(t1)).*f)(std::forward<Args>(args)...);
-    }
-  };
-
-  template<>
-  struct Invoker<false, true>
-  {
-    template<class T, class F, class T1, class... Args>
-    inline static auto invoke (F T::* f, T1&& t1, Args&&... args) ->\
-      decltype(InvokerHelper<std::is_base_of<T,typename std::decay<T1>::type>::value>::get(t1).*f)
-    {
-      return InvokerHelper<std::is_base_of<T,typename std::decay<T1>::type>::value>::get(t1).*f;
-    }
-  };
-
-  template<class F, class... Args>
-  struct InvokeResult
-  {
-    typedef Invoker<std::is_member_function_pointer<typename std::remove_reference<F>::type>::value,
-                    std::is_member_object_pointer<typename std::remove_reference<F>::type>::value &&
-                    (sizeof...(Args) == 1)> invoker;
-    inline static auto invoke (F&& f, Args&&... args) -> decltype(invoker::invoke(std::forward<F>(f), std::forward<Args>(args)...))
-    {
-      return invoker::invoke(std::forward<F>(f), std::forward<Args>(args)...);
-    };
-  };
-
-  template<class F, class...Args>
-  auto invoke (F&& f, Args&&... args) -> decltype(InvokeResult<F, Args...>::invoke(std::forward<F>(f), std::forward<Args>(args)...))
-  {
-    return InvokeResult<F, Args...>::invoke(std::forward<F>(f), std::forward<Args>(args)...);
-  }
-#else
-    using std::invoke;
-#endif
-
-    template<int...>
+    template<std::size_t...>
     struct IntSeq {};
 
-    template<int N, int... S>
+    template<std::size_t N, std::size_t... S>
     struct GenIntSeq : GenIntSeq<N-1, N-1, S...> { };
 
-    template<int... S>
+    template<std::size_t... S>
     struct GenIntSeq<0, S...> { typedef IntSeq<S...> type; };
 
-    // We can't define the Call struct in the function - the standard forbids template methods in that case
-    template<class Func, typename... Args>
-    class ThreadFuncCall
+//    Use a template specialization to avoid relying on compiler optimization
+//  when determining the parameter integer sequence.
+    template<class Func, class T, typename... Args>
+    class ThreadFuncCall;
+// We can't define the Call struct in the function - the standard forbids template methods in that case
+    template<class Func, std::size_t... S, typename... Args>
+    class ThreadFuncCall<Func, detail::IntSeq<S...>, Args...>
     {
-        typedef std::tuple<Args...> Tuple;
-        Func mFunc;
+        static_assert(sizeof...(S) == sizeof...(Args), "Args must match.");
+        using Tuple = std::tuple<typename std::decay<Args>::type...>;
+        typename std::decay<Func>::type mFunc;
         Tuple mArgs;
 
-        template <int... S>
-        void callFunc(detail::IntSeq<S...>)
-        {
-            detail::invoke(std::forward<Func>(mFunc), std::get<S>(std::forward<Tuple>(mArgs)) ...);
-        }
     public:
         ThreadFuncCall(Func&& aFunc, Args&&... aArgs)
-        :mFunc(std::forward<Func>(aFunc)), mArgs(std::forward<Args>(aArgs)...){}
+          : mFunc(std::forward<Func>(aFunc)),
+            mArgs(std::forward<Args>(aArgs)...)
+        {
+        }
 
         void callFunc()
         {
-            callFunc(typename detail::GenIntSeq<sizeof...(Args)>::type());
+            detail::invoke(std::move(mFunc), std::move(std::get<S>(mArgs)) ...);
         }
     };
 
-}
+//  Allow construction of threads without exposing implementation.
+    class ThreadIdTool;
+} //  Namespace "detail"
 
 class thread
 {
 public:
     class id
     {
-        DWORD mId;
-        void clear() {mId = 0;}
+        DWORD mId = 0;
         friend class thread;
         friend class std::hash<id>;
+        friend class detail::ThreadIdTool;
+        explicit id(DWORD aId) noexcept : mId(aId){}
     public:
-        explicit id(DWORD aId=0) noexcept : mId(aId){}
+        id (void) noexcept = default;
         friend bool operator==(id x, id y) noexcept {return x.mId == y.mId; }
         friend bool operator!=(id x, id y) noexcept {return x.mId != y.mId; }
         friend bool operator< (id x, id y) noexcept {return x.mId <  y.mId; }
@@ -198,6 +140,7 @@ public:
     };
 private:
     static constexpr HANDLE kInvalidHandle = nullptr;
+    static constexpr DWORD kInfinite = 0xffffffffl;
     HANDLE mHandle;
     id mThreadId;
 
@@ -212,7 +155,14 @@ private:
     static unsigned int _hardware_concurrency_helper() noexcept
     {
         SYSTEM_INFO sysinfo;
+//    This is one of the few functions used by the library which has a nearly-
+//  equivalent function defined in earlier versions of Windows. Include the
+//  workaround, just as a reminder that it does exist.
+#if defined(_WIN32_WINNT) && (_WIN32_WINNT >= 0x0501)
         ::GetNativeSystemInfo(&sysinfo);
+#else
+        ::GetSystemInfo(&sysinfo);
+#endif
         return sysinfo.dwNumberOfProcessors;
     }
 public:
@@ -225,7 +175,7 @@ public:
     :mHandle(other.mHandle), mThreadId(other.mThreadId)
     {
         other.mHandle = kInvalidHandle;
-        other.mThreadId.clear();
+        other.mThreadId = id{};
     }
 
     thread(const thread &other)=delete;
@@ -233,14 +183,13 @@ public:
     template<class Func, typename... Args>
     explicit thread(Func&& func, Args&&... args) : mHandle(), mThreadId()
     {
-        typedef detail::ThreadFuncCall<Func, Args...> Call;
+        using ArgSequence = typename detail::GenIntSeq<sizeof...(Args)>::type;
+        using Call = detail::ThreadFuncCall<Func, ArgSequence, Args...>;
         auto call = new Call(
             std::forward<Func>(func), std::forward<Args>(args)...);
+        unsigned id_receiver;
         auto int_handle = _beginthreadex(NULL, 0, threadfunc<Call>,
-            static_cast<LPVOID>(call), 0,
-            reinterpret_cast<unsigned*>(&(mThreadId.mId)));
-        /*mHandle = (HANDLE)_beginthreadex(NULL, 0, threadfunc<Call>,
-            (LPVOID)call, 0, (unsigned*)&(mThreadId.mId));*/
+            static_cast<LPVOID>(call), 0, &id_receiver);
         if (int_handle == 0)
         {
             mHandle = kInvalidHandle;
@@ -248,11 +197,18 @@ public:
             delete call;
 //  Note: Should only throw EINVAL, EAGAIN, EACCES
             throw std::system_error(errnum, std::generic_category());
-        } else
+        } else {
+            mThreadId.mId = id_receiver;
             mHandle = reinterpret_cast<HANDLE>(int_handle);
+        }
     }
 
     bool joinable() const {return mHandle != kInvalidHandle;}
+
+//    Note: Due to lack of synchronization, this function has a race condition
+//  if called concurrently, which leads to undefined behavior. The same applies
+//  to all other member functions of this class, but this one is mentioned
+//  explicitly.
     void join()
     {
         using namespace std;
@@ -262,10 +218,10 @@ public:
             throw system_error(make_error_code(errc::no_such_process));
         if (!joinable())
             throw system_error(make_error_code(errc::invalid_argument));
-        WaitForSingleObject(mHandle, INFINITE);
+        WaitForSingleObject(mHandle, kInfinite);
         CloseHandle(mHandle);
         mHandle = kInvalidHandle;
-        mThreadId.clear();
+        mThreadId = id{};
     }
 
     ~thread()
@@ -317,18 +273,43 @@ moving another thread to it.\n");
             CloseHandle(mHandle);
             mHandle = kInvalidHandle;
         }
-        mThreadId.clear();
+        mThreadId = id{};
     }
 };
 
+namespace detail
+{
+    class ThreadIdTool
+    {
+    public:
+        static thread::id make_id (DWORD base_id) noexcept
+        {
+            return thread::id(base_id);
+        }
+    };
+} //  Namespace "detail"
+
 namespace this_thread
 {
-    inline thread::id get_id() noexcept {return thread::id(GetCurrentThreadId());}
+    inline thread::id get_id() noexcept
+    {
+        return detail::ThreadIdTool::make_id(GetCurrentThreadId());
+    }
     inline void yield() noexcept {Sleep(0);}
     template< class Rep, class Period >
     void sleep_for( const std::chrono::duration<Rep,Period>& sleep_duration)
     {
-        Sleep(std::chrono::duration_cast<std::chrono::milliseconds>(sleep_duration).count());
+        static constexpr DWORD kInfinite = 0xffffffffl;
+        using namespace std::chrono;
+        using rep = milliseconds::rep;
+        rep ms = duration_cast<milliseconds>(sleep_duration).count();
+        while (ms > 0)
+        {
+            constexpr rep kMaxRep = static_cast<rep>(kInfinite - 1);
+            auto sleepTime = (ms < kMaxRep) ? ms : kMaxRep;
+            Sleep(static_cast<DWORD>(sleepTime));
+            ms -= sleepTime;
+        }
     }
     template <class Clock, class Duration>
     void sleep_until(const std::chrono::time_point<Clock,Duration>& sleep_time)

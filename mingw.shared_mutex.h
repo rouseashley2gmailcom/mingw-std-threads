@@ -32,16 +32,6 @@
 #endif
 
 #include <cassert>
-
-//    Use MinGW's shared_lock class template, if it's available. Requires C++14.
-//  If unavailable (eg. because this library is being used in C++11), then an
-//  implementation of shared_lock is provided by this header.
-#if (__cplusplus >= 201402L)
-#include <shared_mutex>
-#endif
-//  For defer_lock_t, adopt_lock_t, and try_to_lock_t
-#include "mingw.mutex.h"
-
 //  For descriptive errors.
 #include <system_error>
 //    Implementing a shared_mutex without OS support will require atomic read-
@@ -49,13 +39,31 @@
 #include <atomic>
 //  For timing in shared_lock and shared_timed_mutex.
 #include <chrono>
+#include <limits>
 
+//    Use MinGW's shared_lock class template, if it's available. Requires C++14.
+//  If unavailable (eg. because this library is being used in C++11), then an
+//  implementation of shared_lock is provided by this header.
+#if (__cplusplus >= 201402L)
+#include <shared_mutex>
+#endif
+
+//  For defer_lock_t, adopt_lock_t, and try_to_lock_t
+#include "mingw.mutex.h"
 //  For this_thread::yield.
-#include "mingw.thread.h"
+//#include "mingw.thread.h"
 
 //  Might be able to use native Slim Reader-Writer (SRW) locks.
 #ifdef _WIN32
-#include <windows.h>
+#include <sdkddkver.h>  //  Detect Windows version.
+#if (defined(__MINGW32__) && !defined(__MINGW64_VERSION_MAJOR))
+#pragma message "The Windows API that MinGW-w32 provides is not fully compatible\
+ with Microsoft's API. We'll try to work around this, but we can make no\
+ guarantees. This problem does not exist in MinGW-w64."
+#include <windows.h>    //  No further granularity can be expected.
+#else
+#include <synchapi.h>
+#endif
 #endif
 
 namespace mingw_stdthread
@@ -66,23 +74,17 @@ namespace portable
 class shared_mutex
 {
     typedef uint_fast16_t counter_type;
-    std::atomic<counter_type> mCounter;
-    static constexpr counter_type kWriteBit = 1 << (sizeof(counter_type) * CHAR_BIT - 1);
+    std::atomic<counter_type> mCounter {0};
+    static constexpr counter_type kWriteBit = 1 << (std::numeric_limits<counter_type>::digits - 1);
 
 #if STDMUTEX_RECURSION_CHECKS
 //  Runtime checker for verifying owner threads. Note: Exclusive mode only.
-    _OwnerThread mOwnerThread;
+    _OwnerThread mOwnerThread {};
 #endif
 public:
     typedef shared_mutex * native_handle_type;
 
-    shared_mutex ()
-        : mCounter(0)
-#if STDMUTEX_RECURSION_CHECKS
-        , mOwnerThread()
-#endif
-    {
-    }
+    shared_mutex () = default;
 
 //  No form of copying or moving should be allowed.
     shared_mutex (const shared_mutex&) = delete;
@@ -103,12 +105,11 @@ public:
             if (expected >= kWriteBit - 1)
             {
                 using namespace std;
-                using namespace this_thread;
-                yield();
                 expected = mCounter.load(std::memory_order_relaxed);
                 continue;
             }
-            if (mCounter.compare_exchange_weak(expected, expected + 1,
+            if (mCounter.compare_exchange_weak(expected,
+                                               static_cast<counter_type>(expected + 1),
                                                std::memory_order_acquire,
                                                std::memory_order_relaxed))
                 break;
@@ -118,11 +119,12 @@ public:
 
     bool try_lock_shared (void)
     {
-        counter_type expected = mCounter.load(std::memory_order_relaxed) & (~kWriteBit);
+        counter_type expected = mCounter.load(std::memory_order_relaxed) & static_cast<counter_type>(~kWriteBit);
         if (expected + 1 == kWriteBit)
             return false;
         else
-            return mCounter.compare_exchange_strong( expected, expected + 1,
+            return mCounter.compare_exchange_strong( expected,
+                                                    static_cast<counter_type>(expected + 1),
                                                     std::memory_order_acquire,
                                                     std::memory_order_relaxed);
     }
@@ -131,7 +133,7 @@ public:
     {
         using namespace std;
 #ifndef NDEBUG
-        if (!(mCounter.fetch_sub(1, memory_order_release) & (~kWriteBit)))
+        if (!(mCounter.fetch_sub(1, memory_order_release) & static_cast<counter_type>(~kWriteBit)))
             throw system_error(make_error_code(errc::operation_not_permitted));
 #else
         mCounter.fetch_sub(1, memory_order_release);
@@ -148,12 +150,12 @@ public:
 //  Might be able to use relaxed memory order...
 //  Wait for the write-lock to be unlocked, then claim the write slot.
         counter_type current;
-        while ((current = mCounter.fetch_or(kWriteBit, std::memory_order_acquire)) & kWriteBit)
-            this_thread::yield();
+        while ((current = mCounter.fetch_or(kWriteBit, std::memory_order_acquire)) & kWriteBit);
+            //this_thread::yield();
 //  Wait for readers to finish up.
         while (current != kWriteBit)
         {
-            this_thread::yield();
+            //this_thread::yield();
             current = mCounter.load(std::memory_order_acquire);
         }
 #if STDMUTEX_RECURSION_CHECKS
